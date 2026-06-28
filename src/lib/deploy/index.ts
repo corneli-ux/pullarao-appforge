@@ -10,6 +10,7 @@
  */
 
 import { DeployProvider } from '@prisma/client'
+import crypto from 'crypto'
 
 export interface DeployResult {
   providerDeployId: string
@@ -146,7 +147,7 @@ async function deployNetlify(ctx: DeployContext): Promise<DeployResult> {
       'Content-Type': 'application/zip',
       'Content-Length': zipBuffer.length.toString(),
     },
-    body: zipBuffer,
+    body: new Uint8Array(zipBuffer),
   })
   if (!deployRes.ok) {
     const e = await deployRes.text()
@@ -238,7 +239,7 @@ async function deployCloudflarePages(ctx: DeployContext): Promise<DeployResult> 
     paths.map(async (p, i) => {
       const url = uploadUrls[i]
       if (!url) return
-      await fetch(url, { method: 'PUT', body: fileContents[p] })
+      await fetch(url, { method: 'PUT', body: new Uint8Array(fileContents[p]) })
     })
   )
 
