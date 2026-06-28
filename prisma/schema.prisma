@@ -1,0 +1,251 @@
+// GLM AppForge — multi-user SaaS platform schema
+// Users create accounts, describe apps, GLM 5.2 generates code,
+// platform pushes to their GitHub and deploys to their hosting.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+//  USERS & AUTH
+// ============================================================
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  image         String?
+  plan          Plan     @default(FREE)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  projects      Project[]
+  githubToken   GithubToken?
+  deployTargets DeployTarget[]
+  chatSessions  ChatSession[]
+}
+
+enum Plan {
+  FREE
+  PRO
+  TEAM
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============================================================
+//  ENCRYPTED THIRD-PARTY TOKENS (per-user)
+// ============================================================
+
+/// Stores the user's GitHub Personal Access Token, encrypted at rest.
+/// Used to: create repos, push generated files, trigger Actions.
+model GithubToken {
+  id            String   @id @default(cuid())
+  userId        String   @unique
+  // AES-256-GCM encrypted PAT
+  encryptedPat  String
+  patScopes     String   // comma-separated, e.g. "repo,workflow"
+  githubLogin   String?  // fetched from /user after validation
+  avatarUrl     String?
+  validatedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+/// Stores deployment-provider API tokens per user. A user can have one per provider.
+model DeployTarget {
+  id              String         @id @default(cuid())
+  userId          String
+  provider        DeployProvider
+  // AES-256-GCM encrypted token
+  encryptedToken  String
+  // Provider-specific metadata (e.g. vercel team id, netlify site id)
+  metadata        String?
+  label           String?
+  validatedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deployments Deployment[]
+
+  @@unique([userId, provider])
+}
+
+enum DeployProvider {
+  VERCEL
+  NETLIFY
+  CLOUDFLARE_PAGES
+  GITHUB_PAGES
+}
+
+// ============================================================
+//  PROJECTS  (one per user-built app)
+// ============================================================
+
+model Project {
+  id          String      @id @default(cuid())
+  userId      String
+  name        String
+  slug        String
+  description String?
+  appType     AppType
+  framework   String?     // "nextjs", "static-html", "android-native" etc.
+  status      ProjectStatus @default(DRAFT)
+  glmModel    String      @default("glm-5.2")
+
+  // GitHub linkage
+  githubRepoOwner   String?
+  githubRepoName    String?
+  githubRepoUrl     String?
+  githubActionsRunId String?
+
+  // Deploy linkage
+  deployUrl         String?
+  lastDeployedAt    DateTime?
+
+  // GLM 5.2 generation metadata
+  generationLog     String? // raw chat transcript summary
+  fileCount         Int      @default(0)
+
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  user         User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  files        ProjectFile[]
+  chatSessions ChatSession[]
+  deployments  Deployment[]
+
+  @@unique([userId, slug])
+}
+
+enum AppType {
+  ANDROID_APP
+  WEB_APP
+  STATIC_SITE
+  API_SERVICE
+}
+
+enum ProjectStatus {
+  DRAFT
+  GENERATING
+  GENERATED
+  PUSHING
+  PUSHED
+  DEPLOYING
+  DEPLOYED
+  FAILED
+}
+
+model ProjectFile {
+  id        String   @id @default(cuid())
+  projectId String
+  path      String   // e.g. "app/src/main/java/com/example/MainActivity.kt"
+  content   String
+  language  String?  // "kotlin", "typescript", "json" etc.
+  size      Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, path])
+  @@index([projectId])
+}
+
+model ChatSession {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  title     String   @default("New session")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+}
+
+model ChatMessage {
+  id        String   @id @default(cuid())
+  sessionId String
+  role      String   // "user" | "assistant" | "system"
+  content   String
+  // Tool calls the assistant made (function calling)
+  toolCalls String?  // JSON string
+  // Token usage from GLM
+  tokens    Int?
+  createdAt DateTime @default(now())
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+}
+
+model Deployment {
+  id              String         @id @default(cuid())
+  projectId       String
+  deployTargetId  String
+  provider        DeployProvider
+  status          DeployStatus   @default(PENDING)
+  providerDeployId String?       // vercel deployment id, netlify deploy id etc.
+  url             String?
+  logs            String?
+  errorMessage    String?
+  createdAt       DateTime       @default(now())
+  completedAt     DateTime?
+
+  project      Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  deployTarget DeployTarget @relation(fields: [deployTargetId], references: [id], onDelete: Cascade)
+}
+
+enum DeployStatus {
+  PENDING
+  UPLOADING
+  BUILDING
+  READY
+  ERROR
+}

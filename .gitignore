@@ -1,0 +1,60 @@
+# Node
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+build/
+
+# Bun
+bun.lockb
+
+# Production
+dist/
+
+# Env
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database (SQLite local)
+db/*.db
+db/*.db-journal
+db/*.db-wal
+db/*.db-shm
+ci.db
+
+# Logs
+*.log
+dev.log
+server.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test
+coverage/
+
+# Misc
+*.tsbuildinfo
+next-env.d.ts
+
+# Scaffold artifacts — not part of the actual app
+skills/
+download/
+.zscripts/
+mini-services/
+examples/
+upload/
+android-app/
