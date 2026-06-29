@@ -1,27 +1,32 @@
 import { NextResponse } from 'next/server'
 import { getAuthenticatedUserId } from '@/lib/auth-mobile'
-import ZAI from 'z-ai-web-dev-sdk'
 
-/**
- * Page reader proxy — students paste a URL, GLM reads & extracts content.
- */
+export const runtime = 'nodejs'
+export const maxDuration = 60
 
-let _zaiPromise: Promise<ZAI> | null = null
-function getClient() { if (!_zaiPromise) _zaiPromise = ZAI.create(); return _zaiPromise }
-
+/** POST /api/glm/pagereader — page reader proxy via GLM function call */
 export async function POST(req: Request) {
   const userId = await getAuthenticatedUserId(req)
   if (!userId) return NextResponse.json({ error: 'Sign in required' }, { status: 401 })
-  if (!process.env.GLM_API_KEY) return NextResponse.json({ error: 'Platform not configured' }, { status: 503 })
+  const apiKey = process.env.GLM_API_KEY
+  const baseUrl = process.env.GLM_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/'
+  if (!apiKey) return NextResponse.json({ error: 'Platform not configured' }, { status: 503 })
 
   const body = await req.json().catch(() => null)
   if (!body?.url) return NextResponse.json({ error: 'url required' }, { status: 400 })
 
-  try {
-    const client = await getClient()
-    const result = await client.functions.invoke('page_reader', { url: body.url } as any)
-    return NextResponse.json({ result })
-  } catch (e: any) {
-    return NextResponse.json({ error: e.message }, { status: 500 })
+  const res = await fetch(`${baseUrl.replace(/\/$/, '')}/tools/page-reader`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ url: body.url }),
+  })
+  if (!res.ok) {
+    const t = await res.text()
+    return NextResponse.json({ error: `GLM error ${res.status}: ${t.slice(0, 300)}` }, { status: 502 })
   }
+  const data = await res.json()
+  return NextResponse.json({ result: data })
 }
