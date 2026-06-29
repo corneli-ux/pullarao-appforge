@@ -3,7 +3,8 @@
 // platform pushes to their GitHub and deploys to their hosting.
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
