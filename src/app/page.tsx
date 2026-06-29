@@ -47,7 +47,7 @@ export default async function Home() {
       <section className="max-w-6xl mx-auto px-4 pt-20 pb-16 text-center">
         <div className="inline-flex items-center gap-2 rounded-full bg-emerald-100 px-4 py-1.5 text-sm font-medium text-emerald-800 mb-6">
           <Cpu className="h-4 w-4" />
-          Powered by open-source Pullarao 1
+          Powered by open-source GLM-5.2 · No API key needed for students
         </div>
         <h1 className="text-5xl md:text-6xl font-bold tracking-tight text-gray-900 mb-6">
           Describe an app.
@@ -55,7 +55,7 @@ export default async function Home() {
           <span className="bg-gradient-to-r from-emerald-600 via-teal-600 to-amber-600 bg-clip-text text-transparent">Pullarao 1 builds it.</span>
         </h1>
         <p className="mx-auto max-w-2xl text-lg text-gray-600 mb-8">
-          A multi-user platform that generates complete Android &amp; web apps, pushes them to your own GitHub, and deploys to Vercel, Netlify, or Cloudflare — all driven by your tokens, all in minutes.
+          A learning platform for students. Sign up with just an email, describe what you want to build, and Pullarao 1 generates a complete Android or web app — then pushes it to your GitHub and deploys it. We handle the model so you can focus on building.
         </p>
         <div className="flex flex-col sm:flex-row gap-3 justify-center">
           <Link href="/register">
