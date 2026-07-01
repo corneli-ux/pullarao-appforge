@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { Github, Send, Loader2, FileCode2, Rocket, ExternalLink, Sparkles, ChevronRight, CheckCircle2, XCircle, Cloud, RefreshCw } from 'lucide-react'
+import { Github, Send, Loader2, FileCode2, Rocket, ExternalLink, Sparkles, ChevronRight, CheckCircle2, XCircle, Cloud, RefreshCw, Eye } from 'lucide-react'
 import { toast } from 'sonner'
 
 interface ProjectFile { id: string; path: string; content: string; language: string | null }
@@ -42,14 +42,25 @@ const STATUS_COLOR: Record<string, string> = {
   FAILED: 'bg-red-100 text-red-700',
 }
 
+function prettyToolName(name: string): string {
+  switch (name) {
+    case 'read_file': return 'Reading'
+    case 'str_replace_in_file': return 'Editing'
+    case 'write_file': return 'Writing'
+    case 'delete_file': return 'Deleting'
+    default: return name
+  }
+}
+
 export function ProjectView({ project: initialProject, githubConnected, deployTargets }: Props) {
   const [project, setProject] = useState(initialProject)
-  const [activeTab, setActiveTab] = useState<'chat' | 'files' | 'deploy'>('chat')
+  const [activeTab, setActiveTab] = useState<'chat' | 'files' | 'preview' | 'deploy'>('chat')
   const [chatInput, setChatInput] = useState('')
   const [streaming, setStreaming] = useState(false)
   const [streamingText, setStreamingText] = useState('')
   const [messages, setMessages] = useState<ChatMsg[]>(initialProject.chatSessions[0]?.messages || [])
   const [selectedFile, setSelectedFile] = useState<ProjectFile | null>(initialProject.files[0] || null)
+  const [actionLog, setActionLog] = useState<string[]>([])
   const [pushing, setPushing] = useState(false)
   const [deploying, setDeploying] = useState(false)
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([])
@@ -102,6 +113,7 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
     setChatInput('')
     setStreaming(true)
     setStreamingText('')
+    setActionLog([])
 
     let accumulated = ''
     try {
@@ -125,6 +137,10 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
           const data = line.slice(6)
           try {
             const evt = JSON.parse(data)
+            if (evt.type === 'action') {
+              const label = evt.path ? `${prettyToolName(evt.name)} ${evt.path}` : prettyToolName(evt.name)
+              setActionLog(prev => [...prev, label])
+            }
             if (evt.type === 'token') {
               accumulated += evt.content
               setStreamingText(accumulated)
@@ -134,6 +150,8 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
                 setMessages(prev => [...prev, { id: Date.now().toString() + 'a', role: 'assistant', content: accumulated }])
               }
               setStreamingText('')
+              // Files may have changed (write_file / str_replace_in_file / delete_file) — reload them.
+              refreshProject()
             }
             if (evt.type === 'error') toast.error(evt.message)
           } catch {}
@@ -149,6 +167,7 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
     } finally {
       setStreaming(false)
       setStreamingText('')
+      setActionLog([])
     }
   }
 
@@ -282,6 +301,9 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
         <TabsList>
           <TabsTrigger value="chat"><Sparkles className="h-3 w-3 mr-1" /> Chat with Pullarao 1</TabsTrigger>
           <TabsTrigger value="files"><FileCode2 className="h-3 w-3 mr-1" /> Files ({project.files.length})</TabsTrigger>
+          {project.appType !== 'ANDROID_APP' && (
+            <TabsTrigger value="preview"><Eye className="h-3 w-3 mr-1" /> Preview</TabsTrigger>
+          )}
           <TabsTrigger value="deploy"><Rocket className="h-3 w-3 mr-1" /> Deployments ({project.deployments.length})</TabsTrigger>
         </TabsList>
 
@@ -308,8 +330,13 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
                   ))}
                   {streaming && (
                     <div className="flex justify-start">
-                      <div className="max-w-[80%] rounded-lg p-3 text-sm bg-gray-100">
-                        {streamingText || <Loader2 className="h-3 w-3 animate-spin" />}
+                      <div className="max-w-[80%] rounded-lg p-3 text-sm bg-gray-100 space-y-1">
+                        {actionLog.map((a, i) => (
+                          <div key={i} className="text-xs text-gray-500 font-mono flex items-center gap-1">
+                            <Loader2 className="h-3 w-3 animate-spin" /> {a}
+                          </div>
+                        ))}
+                        {streamingText || (actionLog.length === 0 && <Loader2 className="h-3 w-3 animate-spin" />)}
                       </div>
                     </div>
                   )}
@@ -357,7 +384,70 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
           </Card>
         </TabsContent>
 
-        {/* Deployments tab */}
+        {/* Preview tab */}
+        {project.appType !== 'ANDROID_APP' && (
+          <TabsContent value="preview" className="mt-4">
+            {project.appType === 'STATIC_SITE' ? (
+              <Card className="h-[600px] flex flex-col">
+                <CardHeader className="py-3">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    <Eye className="h-4 w-4" /> Live preview
+                    <span className="text-xs font-normal text-gray-400">— rendered directly from the generated HTML/CSS/JS, no deploy needed</span>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex-1 p-0 border-t">
+                  {project.files.length === 0 ? (
+                    <div className="flex items-center justify-center h-full text-sm text-gray-400">No files yet</div>
+                  ) : (
+                    <iframe
+                      key={project.files.map(f => f.content.length).join(',')}
+                      srcDoc={buildStaticPreviewHtml(project.files)}
+                      sandbox="allow-scripts"
+                      className="w-full h-full border-0"
+                      title="Live preview"
+                    />
+                  )}
+                </CardContent>
+              </Card>
+            ) : (
+              // WEB_APP (Next.js) — there's no in-browser Node/bundler sandbox here, so
+              // we can't run a real dev server for instant preview the way a full agentic
+              // coding tool would. The honest equivalent available today is deploying for
+              // real and showing that — reusing the same deploy() call as the action bar.
+              <Card className="h-[600px] flex flex-col">
+                <CardHeader className="py-3">
+                  <CardTitle className="text-sm flex items-center gap-2">
+                    <Eye className="h-4 w-4" /> Live preview
+                    <span className="text-xs font-normal text-gray-400">— Next.js needs a real build, so preview means deploying</span>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex-1 p-0 border-t flex flex-col">
+                  {project.deployUrl ? (
+                    <iframe src={project.deployUrl} className="w-full h-full border-0" title="Live preview" />
+                  ) : (
+                    <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-6">
+                      <p className="text-sm text-gray-500 max-w-sm">
+                        No deployment yet. {deployTargets.length === 0
+                          ? 'Connect a deploy provider (Vercel, Netlify, or Cloudflare Pages) in Settings, then deploy to see a live preview here.'
+                          : 'Deploy to get a live, working preview.'}
+                      </p>
+                      {deployTargets.length > 0 && (
+                        <div className="flex gap-2">
+                          {deployTargets.map(p => (
+                            <Button key={p} onClick={() => deploy(p)} disabled={deploying} size="sm">
+                              {deploying ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Rocket className="h-4 w-4 mr-1" />}
+                              Deploy to {p}
+                            </Button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+          </TabsContent>
+        )}
         <TabsContent value="deploy" className="mt-4">
           <Card>
             <CardHeader><CardTitle>Deployment history</CardTitle></CardHeader>
@@ -386,6 +476,48 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
       </Tabs>
     </main>
   )
+}
+
+// ---- Static site preview ----
+
+/**
+ * Builds a self-contained HTML document for iframe srcDoc by inlining any
+ * local <link rel="stylesheet"> and <script src="..."> references into
+ * <style>/<script> tags. This works entirely client-side with no build
+ * step or server — appropriate for STATIC_SITE projects (plain HTML/CSS/JS
+ * with no bundler), which is exactly what a live "just open it" preview
+ * needs. It intentionally does NOT attempt this for WEB_APP (Next.js)
+ * projects — those need an actual build, which is a real limitation
+ * documented in the Preview tab rather than faked here.
+ */
+function buildStaticPreviewHtml(files: ProjectFile[]): string {
+  const byPath = new Map(files.map(f => [f.path.replace(/^\.?\//, ''), f]))
+  const entry =
+    byPath.get('index.html') ||
+    files.find(f => f.path.toLowerCase().endsWith('.html'))
+  if (!entry) return '<p style="font-family: sans-serif; padding: 2rem; color: #888;">No index.html found yet.</p>'
+
+  let html = entry.content
+
+  html = html.replace(
+    /<link\s+[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*>|<link\s+[^>]*href=["']([^"']+)["'][^>]*rel=["']stylesheet["'][^>]*>/gi,
+    (match, href1, href2) => {
+      const href = (href1 || href2 || '').replace(/^\.?\//, '')
+      const css = byPath.get(href)
+      return css ? `<style>\n${css.content}\n</style>` : match
+    }
+  )
+
+  html = html.replace(
+    /<script\s+[^>]*src=["']([^"']+)["'][^>]*><\/script>/gi,
+    (match, src) => {
+      const cleanSrc = src.replace(/^\.?\//, '')
+      const js = byPath.get(cleanSrc)
+      return js ? `<script>\n${js.content}\n</script>` : match
+    }
+  )
+
+  return html
 }
 
 // ---- File tree helpers ----
