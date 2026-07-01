@@ -52,6 +52,7 @@ export default async function Dashboard() {
             AppForge
           </Link>
           <div className="flex items-center gap-3">
+            <Link href="/playground"><Button variant="ghost" size="sm">GLM Studio</Button></Link>
             <Link href="/settings"><Button variant="ghost" size="sm">Settings</Button></Link>
             <Link href="/projects/new"><Button size="sm"><Plus className="h-4 w-4 mr-1" /> New project</Button></Link>
           </div>
