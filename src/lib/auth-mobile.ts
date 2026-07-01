@@ -1,6 +1,5 @@
 import { auth } from '@/lib/auth'
 import { verifyMobileToken } from '@/app/api/mobile/login/route'
-import ZAI from 'z-ai-web-dev-sdk'
 
 /**
  * Auth helper for GLM proxy endpoints — accepts either:

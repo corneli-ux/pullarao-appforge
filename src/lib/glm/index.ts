@@ -1,35 +1,49 @@
-import ZAI from 'z-ai-web-dev-sdk'
 import { z } from 'zod'
 
 /**
  * Pullarao 1 service — single entry point for all AI features.
  *
  * Pullarao 1 is the open-source flagship model (powered by the GLM 5.2
- * architecture). We talk to it via the ZAI SDK, which is OpenAI-compatible
- * and routes to the model endpoint.
+ * architecture). We call GLM directly via fetch — NOT the z-ai-web-dev-sdk,
+ * which reads from a .z-ai-config file that doesn't exist (and can't be
+ * written) on Vercel's read-only serverless filesystem. This mirrors the
+ * fix already applied to /api/glm/chat/route.ts and friends.
  *
  * Capabilities used:
  *  - streaming chat completions (for real-time UX)
- *  - tool / function calling (for orchestration: create_repo, deploy, etc.)
- *  - structured output via JSON schema (for project file generation)
+ *  - tool / function calling (for project generation — see templates/index.ts
+ *    for the agentic write_file loop this powers)
+ *  - structured output via JSON schema (for smaller one-shot generations)
  */
 
-const MODEL_ID = 'glm-5.2' // upstream identifier — do not rename
+const MODEL_ID = process.env.GLM_MODEL || 'glm-5.2'
 const MODEL_DISPLAY_NAME = 'Pullarao 1'
 
-let _zai: ZAI | null = null
-async function getClient(): Promise<ZAI> {
-  if (_zai) return _zai
-  _zai = await ZAI.create()
-  return _zai
+function apiKey(): string {
+  const key = process.env.GLM_API_KEY
+  if (!key) throw new Error('Platform not configured — admin must set GLM_API_KEY')
+  return key
+}
+
+function baseUrl(): string {
+  return (process.env.GLM_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/').replace(/\/$/, '')
 }
 
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool'
+
+export interface RawToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
 
 export interface ChatMessage {
   role: ChatRole
   content: string
   tool_call_id?: string
+  /** Present on assistant messages that made tool calls — must be echoed
+   *  back verbatim on the next turn so GLM can match tool results to calls. */
+  tool_calls?: RawToolCall[]
 }
 
 export interface ToolDefinition {
@@ -47,8 +61,17 @@ export interface StreamCallbacks {
   onDone?: (full: string) => void
 }
 
+function toWireMessage(m: ChatMessage) {
+  return {
+    role: m.role,
+    content: m.content,
+    ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+    ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+  }
+}
+
 /**
- * Non-streaming chat — used for one-shot tasks like file generation.
+ * Non-streaming chat — used for tool-calling loops and one-shot tasks.
  */
 export async function chat(
   messages: ChatMessage[],
@@ -59,25 +82,37 @@ export async function chat(
     json?: boolean // force JSON output
   } = {}
 ): Promise<{ content: string; toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> }> {
-  const client = await getClient()
-  const response = await client.chat.completions.create({
-    model: MODEL_ID,
-    messages: messages.map(m => ({ role: m.role, content: m.content })),
-    temperature: opts.temperature ?? 0.7,
-    max_tokens: opts.maxTokens ?? 4096,
-    ...(opts.tools ? ({ tools: opts.tools as any } as any) : {}),
-    ...(opts.json ? ({ response_format: { type: 'json_object' } } as any) : {}),
-    thinking: { type: 'disabled' },
+  const res = await fetch(`${baseUrl()}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey()}`,
+    },
+    body: JSON.stringify({
+      model: MODEL_ID,
+      messages: messages.map(toWireMessage),
+      temperature: opts.temperature ?? 0.7,
+      max_tokens: opts.maxTokens ?? 4096,
+      ...(opts.tools ? { tools: opts.tools, tool_choice: 'auto' } : {}),
+      ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
+      thinking: { type: 'disabled' },
+    }),
   })
-  const choice = response.choices?.[0]
-  const content = (choice?.message as any)?.content ?? ''
-  // ZAI returns tool_calls on the message if any
-  const rawToolCalls = (choice?.message as any)?.tool_calls ?? []
-  const toolCalls = rawToolCalls.map((tc: any) => ({
-    id: tc.id,
-    name: tc.function?.name,
-    arguments: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {},
-  })).filter((tc: any) => tc.name)
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`GLM API error ${res.status}: ${errText.slice(0, 500)}`)
+  }
+  const data = await res.json()
+  const choice = data.choices?.[0]
+  const content = choice?.message?.content ?? ''
+  const rawToolCalls = choice?.message?.tool_calls ?? []
+  const toolCalls = rawToolCalls
+    .map((tc: any) => ({
+      id: tc.id,
+      name: tc.function?.name,
+      arguments: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {},
+    }))
+    .filter((tc: any) => tc.name)
   return { content, toolCalls }
 }
 
@@ -90,21 +125,29 @@ export async function streamChat(
   callbacks: StreamCallbacks,
   opts: { temperature?: number; maxTokens?: number; tools?: ToolDefinition[] } = {}
 ): Promise<void> {
-  // When stream:true the ZAI SDK returns the raw ReadableStream from the
-  // fetch Response (not a Response object). We read it directly.
-  const client = await getClient()
-  const stream: ReadableStream<Uint8Array> = await client.chat.completions.create({
-    model: MODEL_ID,
-    messages: messages.map(m => ({ role: m.role, content: m.content })),
-    temperature: opts.temperature ?? 0.7,
-    max_tokens: opts.maxTokens ?? 4096,
-    stream: true,
-    ...(opts.tools ? ({ tools: opts.tools as any } as any) : {}),
-    thinking: { type: 'disabled' },
-  } as any)
+  const res = await fetch(`${baseUrl()}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey()}`,
+    },
+    body: JSON.stringify({
+      model: MODEL_ID,
+      messages: messages.map(toWireMessage),
+      temperature: opts.temperature ?? 0.7,
+      max_tokens: opts.maxTokens ?? 4096,
+      stream: true,
+      ...(opts.tools ? { tools: opts.tools, tool_choice: 'auto' } : {}),
+      thinking: { type: 'disabled' },
+    }),
+  })
+  if (!res.ok) {
+    const errText = await res.text()
+    throw new Error(`GLM API error ${res.status}: ${errText.slice(0, 500)}`)
+  }
 
   let full = ''
-  const reader = stream.getReader()
+  const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
 
@@ -142,8 +185,10 @@ export async function streamChat(
 }
 
 /**
- * Generate structured output — used for project file generation.
- * Pullarao 1 returns JSON conforming to the provided Zod schema.
+ * Generate structured output — used for small, single-shot JSON tasks.
+ * For anything file-sized (a whole project), use the agentic write_file
+ * loop in templates/index.ts instead — a single JSON blob has a hard
+ * max_tokens ceiling that silently truncates larger projects.
  */
 export async function generateJson<T>(
   messages: ChatMessage[],

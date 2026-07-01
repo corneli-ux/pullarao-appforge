@@ -1,16 +1,30 @@
-import { z } from 'zod'
-import { chat, GLM_MODEL_ID, type ChatMessage } from '../glm'
+import { chat, type ChatMessage, type ToolDefinition, type RawToolCall } from '../glm'
 
 /**
  * Project generators — drive Pullarao 1 to produce complete project filesets.
  *
- * Each generator:
- *   1. Builds a domain-specific system prompt
- *   2. Sends the user's description
- *   3. Parses GLM's JSON response into a file manifest
- *   4. Returns the files ready to push to GitHub
+ * ARCHITECTURE (for students):
+ * Earlier this asked GLM for the entire project as one giant JSON blob in a
+ * single response. That breaks down for anything non-trivial: max_tokens
+ * caps the response size, so a real Android project (20+ files: gradle
+ * config, manifest, Kotlin sources, resources...) gets silently truncated
+ * into invalid JSON.
  *
- * We use JSON-mode responses for structured output.
+ * This is the same problem Claude Code and GLM-5.2's "agentic engineering"
+ * mode are built to solve — instead of one huge response, the model calls a
+ * `write_file` tool once per file, in a loop, until it calls `finish_project`.
+ * Each turn only needs to produce one file's worth of tokens, so project
+ * size is no longer bounded by a single response's token limit. This is a
+ * real (if simplified) example of the "plan → act → repeat" loop that
+ * powers agentic coding tools — read `generateProjectAgentic` below meta to
+ * see the whole loop end to end.
+ *
+ * The one thing this does NOT do that Claude Code / a real CI pipeline does:
+ * actually compile/run the generated code and feed errors back in. There's
+ * no sandboxed build environment on the server (Vercel serverless can't run
+ * `./gradlew build` or `npm run build` inside a request). That verification
+ * instead happens for real, after the fact, in GitHub Actions once the
+ * project is pushed — see `.github/workflows/*.yml` in generated repos.
  */
 
 export interface GeneratedFile {
@@ -26,15 +40,146 @@ export interface GeneratedProject {
   appType: 'ANDROID_APP' | 'WEB_APP' | 'STATIC_SITE'
 }
 
-const fileManifestSchema = z.object({
-  files: z.array(z.object({
-    path: z.string().describe('Repo-relative path, e.g. "src/app/page.tsx"'),
-    content: z.string().describe('Full file contents'),
-    language: z.string().describe('Programming language: kotlin, typescript, javascript, json, yaml, toml, html, css, md'),
-  })),
-  summary: z.string().describe('One-paragraph summary of what was built'),
-  framework: z.string(),
-})
+const MAX_TURNS = 60
+const MAX_FILES = 80
+
+const WRITE_FILE_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'write_file',
+    description:
+      'Write ONE file of the project. Call this once per file, in a sensible build order ' +
+      '(project/build config first, then manifests, then source files, then resources). ' +
+      'Do not try to fit multiple files into one call.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Repo-relative path, e.g. "src/app/page.tsx"' },
+        content: { type: 'string', description: 'The complete, final contents of this file' },
+        language: {
+          type: 'string',
+          description: 'kotlin | typescript | javascript | json | yaml | toml | gradle | xml | html | css | md',
+        },
+      },
+      required: ['path', 'content', 'language'],
+    },
+  },
+}
+
+const FINISH_TOOL: ToolDefinition = {
+  type: 'function',
+  function: {
+    name: 'finish_project',
+    description:
+      'Call this exactly once, after every required file has been written with write_file, ' +
+      'to signal the project is complete and buildable.',
+    parameters: {
+      type: 'object',
+      properties: {
+        summary: { type: 'string', description: 'One paragraph describing what was built' },
+      },
+      required: ['summary'],
+    },
+  },
+}
+
+/**
+ * The agentic generation loop.
+ *
+ *   1. Send the role prompt + user request, offering write_file / finish_project as tools
+ *   2. GLM calls write_file — we save the file, echo a tool result, loop
+ *   3. GLM calls finish_project — we stop
+ *   4. If GLM replies with plain text instead of a tool call, we nudge it to
+ *      keep calling tools (some models narrate progress in text sometimes)
+ *
+ * `onFile` is called synchronously after each file is produced, so callers
+ * (see /api/projects/route.ts) can persist files incrementally — students
+ * watching a project generate see files appear one by one, not all at once
+ * at the very end.
+ */
+async function generateProjectAgentic(
+  roleSystemPrompt: string,
+  userDescription: string,
+  appType: GeneratedProject['appType'],
+  defaultFramework: string,
+  onFile?: (f: GeneratedFile, index: number) => Promise<void> | void
+): Promise<GeneratedProject> {
+  const messages: ChatMessage[] = [
+    { role: 'system', content: roleSystemPrompt },
+    {
+      role: 'user',
+      content:
+        `User request:\n\n${userDescription}\n\n` +
+        `Build this now. Call write_file once per file — start with project/build config, ` +
+        `then source files, then resources. Call finish_project only once everything needed ` +
+        `to build and run the project has been written.`,
+    },
+  ]
+
+  const files: GeneratedFile[] = []
+  let summary = ''
+  let finished = false
+
+  for (let turn = 0; turn < MAX_TURNS && !finished && files.length < MAX_FILES; turn++) {
+    const { content, toolCalls } = await chat(messages, {
+      temperature: 0.3,
+      maxTokens: 6000,
+      tools: [WRITE_FILE_TOOL, FINISH_TOOL],
+    })
+
+    if (toolCalls.length === 0) {
+      // Model responded with plain text instead of a tool call — nudge it back on track.
+      messages.push({ role: 'assistant', content: content || '' })
+      messages.push({
+        role: 'user',
+        content: files.length === 0
+          ? 'Start writing files now — call write_file for the first file.'
+          : 'Continue — call write_file for the next remaining file, or finish_project if the project is complete.',
+      })
+      continue
+    }
+
+    const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
+      id: tc.id,
+      type: 'function',
+      function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+    }))
+    messages.push({ role: 'assistant', content: content || '', tool_calls: rawToolCalls })
+
+    for (const tc of toolCalls) {
+      if (tc.name === 'write_file') {
+        const path = String(tc.arguments.path || '').trim()
+        const fileContent = String(tc.arguments.content ?? '')
+        const language = String(tc.arguments.language || 'text')
+        if (!path) {
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: 'Error: path is required. Retry with a valid path.' })
+          continue
+        }
+        const file: GeneratedFile = { path, content: fileContent, language }
+        files.push(file)
+        await onFile?.(file, files.length - 1)
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: `Saved ${path} (${fileContent.length} chars). Continue with the next file.` })
+      } else if (tc.name === 'finish_project') {
+        summary = String(tc.arguments.summary || '')
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: 'Project marked complete.' })
+        finished = true
+      } else {
+        messages.push({ role: 'tool', tool_call_id: tc.id, content: `Unknown tool ${tc.name}` })
+      }
+    }
+  }
+
+  if (files.length === 0) {
+    throw new Error('Pullarao 1 did not generate any files. Try a more specific description.')
+  }
+  if (!finished) {
+    // Hit MAX_TURNS/MAX_FILES without an explicit finish — still return what we have
+    // rather than throwing away real work, but note it in the summary.
+    summary = summary || `Generated ${files.length} files (stopped at the turn/file limit before Pullarao 1 signaled completion — review for missing pieces).`
+  }
+
+  return { files, summary: summary || `Generated ${files.length} files.`, framework: defaultFramework, appType }
+}
 
 // ============================================================
 //  ANDROID APP GENERATOR
@@ -42,18 +187,12 @@ const fileManifestSchema = z.object({
 
 export async function generateAndroidApp(
   userDescription: string,
-  packageName: string = 'com.user.app'
+  packageName: string = 'com.user.app',
+  onFile?: (f: GeneratedFile, index: number) => Promise<void> | void
 ): Promise<GeneratedProject> {
-  const systemPrompt = `You are a senior Android engineer. Generate a COMPLETE, BUILDABLE Android Studio project (Kotlin + Jetpack Compose + Hilt + Room + Retrofit + Material 3) that fulfills the user's request.
+  const systemPrompt = `You are a senior Android engineer generating a COMPLETE, BUILDABLE Android Studio project (Kotlin + Jetpack Compose + Hilt + Room + Retrofit + Material 3), one file at a time via the write_file tool.
 
-Output ONLY a JSON object matching this exact schema:
-{
-  "files": [{ "path": "...", "content": "...", "language": "kotlin"|"typescript"|"xml"|"json"|"toml"|"gradle"|"md"|"yaml" }],
-  "summary": "One paragraph summary",
-  "framework": "android-native"
-}
-
-The project MUST include these files at minimum:
+The project MUST include at minimum these files (call write_file once for each):
 - settings.gradle.kts
 - build.gradle.kts (root)
 - gradle/libs.versions.toml (version catalog)
@@ -78,6 +217,7 @@ The project MUST include these files at minimum:
 - .github/workflows/android.yml (CI to build debug APK on push)
 - .gitignore
 - README.md
+— plus every Kotlin source file the feature actually needs (screens, ViewModels, Room entities/DAOs, Retrofit interfaces, DI modules, navigation).
 
 Rules:
 - Application ID must be ${packageName}
@@ -88,27 +228,23 @@ Rules:
 - The launcher foreground drawable must be defined as a vector drawable, not a mipmap resource.
 - The .github/workflows/android.yml must run on push to main, set up JDK 17 + Gradle 8.10.2, generate the gradle wrapper, run assembleDebug, and upload the APK artifact.
 - README.md should describe how to build locally and via GitHub Actions.
+- Call write_file once per file — never combine multiple files into one call.
+- Call finish_project only once the project is fully buildable end to end.`
 
-Respond with JSON only — no markdown fences, no explanation.`
-
-  return await callGenerator(systemPrompt, userDescription, 'ANDROID_APP', 'android-native')
+  return generateProjectAgentic(systemPrompt, userDescription, 'ANDROID_APP', 'android-native', onFile)
 }
 
 // ============================================================
 //  NEXT.JS WEB APP GENERATOR
 // ============================================================
 
-export async function generateNextJsApp(userDescription: string): Promise<GeneratedProject> {
-  const systemPrompt = `You are a senior fullstack engineer. Generate a COMPLETE Next.js 16 project (App Router + TypeScript + Tailwind CSS 4 + shadcn/ui) that fulfills the user's request.
+export async function generateNextJsApp(
+  userDescription: string,
+  onFile?: (f: GeneratedFile, index: number) => Promise<void> | void
+): Promise<GeneratedProject> {
+  const systemPrompt = `You are a senior fullstack engineer generating a COMPLETE Next.js 16 project (App Router + TypeScript + Tailwind CSS 4 + shadcn/ui), one file at a time via the write_file tool.
 
-Output ONLY a JSON object matching this exact schema:
-{
-  "files": [{ "path": "...", "content": "...", "language": "typescript"|"javascript"|"json"|"css"|"md"|"tsx"|"html" }],
-  "summary": "...",
-  "framework": "nextjs"
-}
-
-The project MUST include:
+The project MUST include (call write_file once for each):
 - package.json (Next 16, React 19, TypeScript 5, Tailwind 4)
 - next.config.ts
 - tsconfig.json
@@ -124,76 +260,44 @@ The project MUST include:
 - .gitignore
 - .env.example
 - README.md
+— plus every additional component, route, and lib file the feature actually needs.
 
 Rules:
 - All code must compile cleanly with no type errors.
 - Use server components by default, mark client components with 'use client'.
 - Tailwind 4 syntax (no @tailwind directives, use @import "tailwindcss").
 - The page must be visually polished, mobile-first, accessible.
+- Call write_file once per file — never combine multiple files into one call.
+- Call finish_project only once the project is fully buildable end to end.`
 
-Respond with JSON only — no markdown fences, no explanation.`
-
-  return await callGenerator(systemPrompt, userDescription, 'WEB_APP', 'nextjs')
+  return generateProjectAgentic(systemPrompt, userDescription, 'WEB_APP', 'nextjs', onFile)
 }
 
 // ============================================================
 //  STATIC SITE GENERATOR
 // ============================================================
 
-export async function generateStaticSite(userDescription: string): Promise<GeneratedProject> {
-  const systemPrompt = `You are a frontend designer. Generate a COMPLETE static website (HTML + CSS + vanilla JS) fulfilling the user's request. Single page or multi-page.
-
-Output ONLY a JSON object matching this exact schema:
-{
-  "files": [{ "path": "...", "content": "...", "language": "html"|"css"|"javascript"|"json" }],
-  "summary": "...",
-  "framework": "static-html"
-}
+export async function generateStaticSite(
+  userDescription: string,
+  onFile?: (f: GeneratedFile, index: number) => Promise<void> | void
+): Promise<GeneratedProject> {
+  const systemPrompt = `You are a frontend designer generating a COMPLETE static website (HTML + CSS + vanilla JS), one file at a time via the write_file tool. Single page or multi-page as appropriate.
 
 Must include:
 - index.html (entry point)
-- styles.css (or styles/ directory)
-- script.js (or scripts/ directory)
+- styles.css (or a styles/ directory)
+- script.js (or a scripts/ directory)
 - README.md
+— plus any additional pages/assets the request needs.
 
 Rules:
 - Valid HTML5, semantic tags, mobile-first.
 - No build step required — opens directly in browser.
 - Inline critical CSS only if it improves perceived performance.
+- Call write_file once per file — never combine multiple files into one call.
+- Call finish_project only once the site is fully complete.`
 
-Respond with JSON only — no markdown fences, no explanation.`
-
-  return await callGenerator(systemPrompt, userDescription, 'STATIC_SITE', 'static-html')
-}
-
-// ============================================================
-//  SHARED CALLER
-// ============================================================
-
-async function callGenerator(
-  systemPrompt: string,
-  userDescription: string,
-  appType: 'ANDROID_APP' | 'WEB_APP' | 'STATIC_SITE',
-  framework: string
-): Promise<GeneratedProject> {
-  const messages: ChatMessage[] = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: `User request:\n\n${userDescription}\n\nGenerate the complete project now.` },
-  ]
-  const { content } = await chat(messages, {
-    temperature: 0.3,
-    maxTokens: 16000,
-    json: true,
-  })
-  // Strip any accidental markdown fences
-  const cleaned = content.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim()
-  const parsed = fileManifestSchema.parse(JSON.parse(cleaned))
-  return {
-    files: parsed.files,
-    summary: parsed.summary,
-    framework: parsed.framework || framework,
-    appType,
-  }
+  return generateProjectAgentic(systemPrompt, userDescription, 'STATIC_SITE', 'static-html', onFile)
 }
 
 // ============================================================
