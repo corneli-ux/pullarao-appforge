@@ -1,6 +1,7 @@
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { chat, type ChatMessage, type ToolDefinition, type RawToolCall } from '@/lib/glm'
+import { acquireGlmSlot } from '@/lib/concurrency'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -158,34 +159,53 @@ Always read_file before editing a file you haven't already read in this conversa
       const send = (evt: Record<string, unknown>) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(evt)}\n\n`))
       try {
         let finalText = ''
-        for (let turn = 0; turn < MAX_EDIT_TURNS; turn++) {
-          const { content, toolCalls } = await chat(messages, {
-            temperature: 0.4,
-            maxTokens: 4096,
-            tools: editTools(),
-          })
+        const release = await acquireGlmSlot(`chat:${chatSession!.id}`)
+        try {
+          for (let turn = 0; turn < MAX_EDIT_TURNS; turn++) {
+            const { content, toolCalls } = await chat(messages, {
+              temperature: 0.4,
+              maxTokens: 4096,
+              tools: editTools(),
+            })
 
-          if (toolCalls.length === 0) {
-            finalText = content
-            send({ type: 'token', content })
-            break
+            if (toolCalls.length === 0) {
+              finalText = content
+              send({ type: 'token', content })
+              break
+            }
+
+            const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
+              id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+            }))
+            // Compact what goes into history — write_file/str_replace_in_file
+            // arguments can carry a whole file's contents. Once the tool result
+            // confirms it saved, later turns only need to know THAT it happened,
+            // not re-see the full text — otherwise a session with several edits
+            // resends every earlier edit's full content on every turn.
+            const historyToolCalls: RawToolCall[] = toolCalls.map(tc => {
+              if (tc.name === 'write_file') {
+                return { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify({ path: tc.arguments.path, language: tc.arguments.language, content: '<omitted — already saved>' }) } }
+              }
+              if (tc.name === 'str_replace_in_file') {
+                return { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify({ path: tc.arguments.path, old_str: '<omitted>', new_str: '<omitted — already applied>' }) } }
+              }
+              return rawToolCalls.find(rtc => rtc.id === tc.id)!
+            })
+            messages.push({ role: 'assistant', content: content || '', tool_calls: historyToolCalls })
+
+            for (const tc of toolCalls) {
+              send({ type: 'action', name: tc.name, path: tc.arguments.path })
+              const result = await executeTool(projectId, tc.name, tc.arguments)
+              messages.push({ role: 'tool', tool_call_id: tc.id, content: result })
+            }
+
+            if (turn === MAX_EDIT_TURNS - 1) {
+              finalText = 'Reached the edit turn limit for this message — the changes made so far are saved. Ask again to continue.'
+              send({ type: 'token', content: finalText })
+            }
           }
-
-          const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
-            id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-          }))
-          messages.push({ role: 'assistant', content: content || '', tool_calls: rawToolCalls })
-
-          for (const tc of toolCalls) {
-            send({ type: 'action', name: tc.name, path: tc.arguments.path })
-            const result = await executeTool(projectId, tc.name, tc.arguments)
-            messages.push({ role: 'tool', tool_call_id: tc.id, content: result })
-          }
-
-          if (turn === MAX_EDIT_TURNS - 1) {
-            finalText = 'Reached the edit turn limit for this message — the changes made so far are saved. Ask again to continue.'
-            send({ type: 'token', content: finalText })
-          }
+        } finally {
+          await release()
         }
 
         send({ type: 'done' })

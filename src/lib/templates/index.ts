@@ -140,12 +140,26 @@ async function generateProjectAgentic(
       continue
     }
 
-    const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
-      id: tc.id,
-      type: 'function',
-      function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-    }))
-    messages.push({ role: 'assistant', content: content || '', tool_calls: rawToolCalls })
+    // Compact what we KEEP in history — for write_file, drop the (often
+    // large) file content once the round trip completes. The model already
+    // committed to writing it and the tool result confirms it saved; future
+    // turns only need to know THAT path X was written, not re-see its full
+    // content again. Without this, every turn resends every prior file's
+    // full text, which is O(n²) in tokens and can blow the context window
+    // outright on bigger projects (a 30-file Android app, for example).
+    const historyToolCalls: RawToolCall[] = toolCalls.map(tc =>
+      tc.name === 'write_file'
+        ? {
+            id: tc.id,
+            type: 'function',
+            function: {
+              name: tc.name,
+              arguments: JSON.stringify({ path: tc.arguments.path, language: tc.arguments.language, content: '<omitted — already saved, see tool result>' }),
+            },
+          }
+        : { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } }
+    )
+    messages.push({ role: 'assistant', content: content || '', tool_calls: historyToolCalls })
 
     for (const tc of toolCalls) {
       if (tc.name === 'write_file') {
@@ -374,10 +388,16 @@ async function verifyAndFixNextJs(
       const { content, toolCalls } = await chat(messages, { temperature: 0.2, maxTokens: 4000, tools: FIX_TOOLS })
       if (toolCalls.length === 0) break // model gave up mid-round with plain text — move to rebuild anyway
 
-      const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
-        id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
-      }))
-      messages.push({ role: 'assistant', content: content || '', tool_calls: rawToolCalls })
+      const historyToolCalls: RawToolCall[] = toolCalls.map(tc => {
+        if (tc.name === 'write_file') {
+          return { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify({ path: tc.arguments.path, language: tc.arguments.language, content: '<omitted — already saved>' }) } }
+        }
+        if (tc.name === 'str_replace_in_file') {
+          return { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify({ path: tc.arguments.path, old_str: '<omitted>', new_str: '<omitted — already applied>' }) } }
+        }
+        return { id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) } }
+      })
+      messages.push({ role: 'assistant', content: content || '', tool_calls: historyToolCalls })
 
       let done = false
       for (const tc of toolCalls) {

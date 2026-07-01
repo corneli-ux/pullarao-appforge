@@ -9,6 +9,7 @@ import {
   suggestRepoName,
   type GeneratedFile,
 } from '@/lib/templates'
+import { acquireGlmSlot } from '@/lib/concurrency'
 
 // The agentic write_file loop makes many sequential GLM calls instead of
 // one — that's what lets project size scale past a single response's
@@ -75,10 +76,16 @@ export async function POST(req: Request) {
 
   // Kick off generation (long-running — done in-band for simplicity, but should be a queue in prod)
   try {
-    const generated =
-      appType === 'ANDROID_APP' ? await generateAndroidApp(description, `com.user.${slug.replace(/-/g, '')}`, onFile)
-      : appType === 'WEB_APP' ? await generateNextJsApp(description, onFile)
-      : await generateStaticSite(description, onFile)
+    const release = await acquireGlmSlot(`generate:${project.id}`)
+    let generated
+    try {
+      generated =
+        appType === 'ANDROID_APP' ? await generateAndroidApp(description, `com.user.${slug.replace(/-/g, '')}`, onFile)
+        : appType === 'WEB_APP' ? await generateNextJsApp(description, onFile)
+        : await generateStaticSite(description, onFile)
+    } finally {
+      await release()
+    }
 
     await db.project.update({
       where: { id: project.id },

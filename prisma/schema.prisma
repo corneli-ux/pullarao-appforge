@@ -250,3 +250,19 @@ enum DeployStatus {
   READY
   ERROR
 }
+
+// ============================================================
+//  GLM CONCURRENCY SLOTS
+// ============================================================
+// A fixed-size semaphore over the shared GLM_API_KEY. All students share
+// one platform API key, and Zhipu enforces concurrency limits per key —
+// without this, N students generating/editing at the same moment means
+// some of them just get rate-limit errors with no queue or retry.
+// GLM_MAX_CONCURRENT slots are lazily created on first use; acquiring one
+// means "you may make GLM calls now", releasing frees it for the next
+// waiting request. See src/lib/concurrency/index.ts.
+model GlmSlot {
+  id     Int       @id
+  heldBy String?
+  heldAt DateTime?
+}
