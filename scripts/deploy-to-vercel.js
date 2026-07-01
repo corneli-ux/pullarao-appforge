@@ -1,9 +1,25 @@
 #!/usr/bin/env node
 /**
- * Deploy pullarao-appforge to Vercel.
+ * Ad-hoc deploy of pullarao-appforge to Vercel via the raw Files/Deployments API.
+ *
+ * ⚠️ NOT RECOMMENDED for ongoing use. This uploads whatever is on disk right
+ * now as a one-off "production" deployment — it is NOT connected to GitHub,
+ * so pushing to main does nothing to it. That mismatch is exactly why the
+ * Android app's DEFAULT_PLATFORM_URL pointed at a deployment that had gone
+ * stale/unreachable: this script was run once, produced some URL, and every
+ * subsequent `git push` never touched that deployment again.
+ *
+ * The correct fix is connecting this repo to Vercel via their standard Git
+ * integration (vercel.com → Add New Project → Import from GitHub) so every
+ * push to main deploys automatically to a STABLE domain. This script is kept
+ * only as a manual fallback if you ever need to deploy without Git access.
  *
  * Usage:
- *   VERCEL_TOKEN=xxx GLM_API_KEY=xxx node scripts/deploy-to-vercel.js
+ *   VERCEL_TOKEN=xxx GLM_API_KEY=xxx AUTH_SECRET=xxx APP_ENCRYPTION_KEY=xxx \
+ *     node scripts/deploy-to-vercel.js /path/to/project
+ *
+ * Generate AUTH_SECRET / APP_ENCRYPTION_KEY with: openssl rand -hex 32
+ * NEVER hardcode real secret values in this file — it's committed to git.
  */
 
 import { createHash } from 'node:crypto'
@@ -12,15 +28,18 @@ import { join, relative } from 'node:path'
 
 const VERCEL_TOKEN = process.env.VERCEL_TOKEN
 const GLM_API_KEY = process.env.GLM_API_KEY
-const PROJECT_ROOT = process.argv[2] || '/home/z/my-project'
+const AUTH_SECRET = process.env.AUTH_SECRET
+const APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY
+const PROJECT_ROOT = process.argv[2]
 const PROJECT_NAME = 'pullarao-appforge'
 
 if (!VERCEL_TOKEN) { console.error('VERCEL_TOKEN env var required'); process.exit(1) }
 if (!GLM_API_KEY) { console.error('GLM_API_KEY env var required'); process.exit(1) }
+if (!AUTH_SECRET) { console.error('AUTH_SECRET env var required — generate with: openssl rand -hex 32'); process.exit(1) }
+if (!APP_ENCRYPTION_KEY) { console.error('APP_ENCRYPTION_KEY env var required — generate with: openssl rand -hex 32'); process.exit(1) }
+if (!PROJECT_ROOT) { console.error('Usage: node scripts/deploy-to-vercel.js /path/to/project'); process.exit(1) }
 
 const VERCEL_API = 'https://api.vercel.com'
-const AUTH_SECRET = 'bbf605ad2cec400a207d3d4a7e5b9fadbca1432e518a3587d084290638d7e868'
-const APP_ENCRYPTION_KEY = '6ddc32800f44f4151608f621d9daed9660608ab44a3edca51b7426ae6245d7a6'
 
 const SKIP = new Set([
   'node_modules', '.next', '.git', 'db', 'skills', 'download',
@@ -184,24 +203,38 @@ async function main() {
   console.log('\n3. Ensuring Vercel project exists...')
   const project = await ensureProject()
 
-  console.log('\n4. Setting environment variables...')
+  console.log('\n4. Setting environment variables (first pass)...')
   await setEnvVar(project.id, 'GLM_API_KEY', GLM_API_KEY)
   await setEnvVar(project.id, 'GLM_MODEL', 'glm-5.2')
   await setEnvVar(project.id, 'GLM_BASE_URL', 'https://open.bigmodel.cn/api/paas/v4/')
   await setEnvVar(project.id, 'AUTH_SECRET', AUTH_SECRET)
   await setEnvVar(project.id, 'APP_ENCRYPTION_KEY', APP_ENCRYPTION_KEY)
-  await setEnvVar(project.id, 'NEXTAUTH_URL', `https://${PROJECT_NAME}.vercel.app`)
   await setEnvVar(project.id, 'DATABASE_URL', 'file:./db/appforge.db')
 
   console.log('\n5. Creating production deployment...')
   const dep = await createDeployment(project, uploaded)
   console.log(`   Deployment ID: ${dep.id}`)
-  console.log(`   URL (provisional): ${dep.url}`)
 
   console.log('\n6. Waiting for build to complete...')
   const finalDep = await pollDeployment(dep.id)
+  const liveUrl = `https://${finalDep.url}`
+  console.log(`   Deployed at: ${liveUrl}`)
+
+  // NEXTAUTH_URL can't be known until Vercel assigns the actual domain —
+  // guessing it as `https://${PROJECT_NAME}.vercel.app` up front is WRONG
+  // whenever Vercel appends a disambiguating suffix (e.g. "-nine") because
+  // the clean name was already claimed by an earlier deployment. Set it
+  // correctly now, then redeploy so the app is built with the right value.
+  console.log('\n7. Correcting NEXTAUTH_URL to the real deployment URL...')
+  await setEnvVar(project.id, 'NEXTAUTH_URL', liveUrl)
+  console.log('\n8. Redeploying so NEXTAUTH_URL is baked in correctly...')
+  const dep2 = await createDeployment(project, uploaded)
+  const finalDep2 = await pollDeployment(dep2.id)
   console.log(`\n✓ DEPLOYED!`)
-  console.log(`  Live URL: https://${finalDep.url}`)
+  console.log(`  Live URL: https://${finalDep2.url}`)
+  console.log(`\n  IMPORTANT: update DEFAULT_PLATFORM_URL in the Android app`)
+  console.log(`  (domain/model/ValueObjects.kt) to match this URL, or just`)
+  console.log(`  set it directly in the app's Settings screen.`)
 }
 
 main().catch(e => {
