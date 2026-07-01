@@ -13,11 +13,14 @@ import {
 // The agentic write_file loop makes many sequential GLM calls instead of
 // one — that's what lets project size scale past a single response's
 // token limit, but it also means generation can take minutes for a big
-// Android project. 300s only takes effect on Vercel Pro/Enterprise; Hobby
-// plans hard-cap at 60s regardless. If generation regularly times out on
-// large projects, the real fix is moving this to a background queue (the
-// original TODO below) rather than raising this further.
-export const maxDuration = 300
+// Android project. Web app generation now also runs a real build check
+// (and up to 2 auto-fix rounds) in a Vercel Sandbox afterward, adding more
+// time on top of that. 800s is close to the highest maxDuration Vercel
+// Functions support at all (Enterprise); Hobby/Pro plans cap lower than
+// this regardless of what's set here. If generation regularly times out,
+// the real fix is moving this to a background queue (the original TODO
+// below) rather than raising this further — there is a real ceiling.
+export const maxDuration = 800
 
 const schema = z.object({
   name: z.string().min(1).max(80),
@@ -57,11 +60,17 @@ export async function POST(req: Request) {
   // project page see files appear one by one (matches how an agentic tool
   // actually works), and if generation is cut off by a serverless timeout,
   // whatever was written so far survives instead of being lost entirely.
+  // Upsert (not create) because the post-generation build-verify-and-fix
+  // pass (see verifyAndFixNextJs) may rewrite a file that was already
+  // persisted during the initial write_file loop.
   const onFile = async (f: GeneratedFile) => {
-    await db.projectFile.create({
-      data: { projectId: project.id, path: f.path, content: f.content, language: f.language, size: f.content.length },
+    await db.projectFile.upsert({
+      where: { projectId_path: { projectId: project.id, path: f.path } },
+      create: { projectId: project.id, path: f.path, content: f.content, language: f.language, size: f.content.length },
+      update: { content: f.content, language: f.language, size: f.content.length },
     })
-    await db.project.update({ where: { id: project.id }, data: { fileCount: { increment: 1 } } })
+    const count = await db.projectFile.count({ where: { projectId: project.id } })
+    await db.project.update({ where: { id: project.id }, data: { fileCount: count } })
   }
 
   // Kick off generation (long-running — done in-band for simplicity, but should be a queue in prod)

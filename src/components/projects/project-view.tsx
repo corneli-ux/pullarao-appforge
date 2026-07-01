@@ -65,6 +65,9 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
   const [deploying, setDeploying] = useState(false)
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([])
   const [loadingRuns, setLoadingRuns] = useState(false)
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [previewError, setPreviewError] = useState<string | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -212,6 +215,22 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
       toast.error(e.message)
     } finally {
       setDeploying(false)
+    }
+  }
+
+  async function startPreview() {
+    setPreviewLoading(true)
+    setPreviewError(null)
+    try {
+      const res = await fetch(`/api/projects/${project.id}/preview`, { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Preview failed to start')
+      setPreviewUrl(data.url)
+    } catch (e: any) {
+      setPreviewError(e.message)
+      toast.error(e.message)
+    } finally {
+      setPreviewLoading(false)
     }
   }
 
@@ -410,37 +429,29 @@ export function ProjectView({ project: initialProject, githubConnected, deployTa
                 </CardContent>
               </Card>
             ) : (
-              // WEB_APP (Next.js) — there's no in-browser Node/bundler sandbox here, so
-              // we can't run a real dev server for instant preview the way a full agentic
-              // coding tool would. The honest equivalent available today is deploying for
-              // real and showing that — reusing the same deploy() call as the action bar.
+              // WEB_APP (Next.js) — a real dev server, running in an isolated
+              // Vercel Sandbox VM. No deploy, no third-party token required —
+              // this is genuine execution, not a static guess.
               <Card className="h-[600px] flex flex-col">
                 <CardHeader className="py-3">
                   <CardTitle className="text-sm flex items-center gap-2">
                     <Eye className="h-4 w-4" /> Live preview
-                    <span className="text-xs font-normal text-gray-400">— Next.js needs a real build, so preview means deploying</span>
+                    <span className="text-xs font-normal text-gray-400">— runs your actual project in a real sandboxed dev server</span>
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="flex-1 p-0 border-t flex flex-col">
-                  {project.deployUrl ? (
-                    <iframe src={project.deployUrl} className="w-full h-full border-0" title="Live preview" />
+                  {previewUrl ? (
+                    <iframe src={previewUrl} className="w-full h-full border-0" title="Live preview" />
                   ) : (
                     <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center px-6">
+                      {previewError && <p className="text-sm text-red-600 max-w-md whitespace-pre-wrap">{previewError}</p>}
                       <p className="text-sm text-gray-500 max-w-sm">
-                        No deployment yet. {deployTargets.length === 0
-                          ? 'Connect a deploy provider (Vercel, Netlify, or Cloudflare Pages) in Settings, then deploy to see a live preview here.'
-                          : 'Deploy to get a live, working preview.'}
+                        Starts a real dev server for this project (npm install + npm run dev) in an isolated sandbox — can take a minute the first time.
                       </p>
-                      {deployTargets.length > 0 && (
-                        <div className="flex gap-2">
-                          {deployTargets.map(p => (
-                            <Button key={p} onClick={() => deploy(p)} disabled={deploying} size="sm">
-                              {deploying ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Rocket className="h-4 w-4 mr-1" />}
-                              Deploy to {p}
-                            </Button>
-                          ))}
-                        </div>
-                      )}
+                      <Button onClick={startPreview} disabled={previewLoading || project.files.length === 0} size="sm">
+                        {previewLoading ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Eye className="h-4 w-4 mr-1" />}
+                        {previewLoading ? 'Starting…' : 'Start live preview'}
+                      </Button>
                     </div>
                   )}
                 </CardContent>

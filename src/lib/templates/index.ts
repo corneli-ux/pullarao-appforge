@@ -1,4 +1,5 @@
 import { chat, type ChatMessage, type ToolDefinition, type RawToolCall } from '../glm'
+import { checkNextJsBuild } from '../sandbox'
 
 /**
  * Project generators — drive Pullarao 1 to produce complete project filesets.
@@ -270,7 +271,154 @@ Rules:
 - Call write_file once per file — never combine multiple files into one call.
 - Call finish_project only once the project is fully buildable end to end.`
 
-  return generateProjectAgentic(systemPrompt, userDescription, 'WEB_APP', 'nextjs', onFile)
+  const project = await generateProjectAgentic(systemPrompt, userDescription, 'WEB_APP', 'nextjs', onFile)
+  return verifyAndFixNextJs(project, onFile)
+}
+
+const MAX_FIX_ROUNDS = 2
+const MAX_FIX_TURNS_PER_ROUND = 10
+
+const FIX_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read the current content of one file.',
+      parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'str_replace_in_file',
+      description: 'Replace one exact, unique occurrence of old_str with new_str in a file. Prefer this over write_file for small fixes.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' }, old_str: { type: 'string' }, new_str: { type: 'string' } },
+        required: ['path', 'old_str', 'new_str'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Fully overwrite (or create) a file.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string' }, content: { type: 'string' }, language: { type: 'string' } },
+        required: ['path', 'content', 'language'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'done_fixing',
+      description: 'Call this once you believe the build error is resolved.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+]
+
+/**
+ * Real "corrects" — the piece that was missing before. Runs the generated
+ * Next.js project in a real sandbox (see lib/sandbox), and if the build
+ * fails, feeds the ACTUAL compiler/bundler error back to GLM in a bounded
+ * read/patch/rebuild loop, up to MAX_FIX_ROUNDS times. This is genuine
+ * verification, not a guess — same category of check Claude Code or
+ * GLM-5.2's agentic mode run before considering a task done.
+ *
+ * If it still fails after all rounds, this returns honestly — it does NOT
+ * silently claim success. The summary says so, and whatever the last
+ * attempt left in place is what gets saved (better than throwing away
+ * real, mostly-working code over one remaining error).
+ */
+async function verifyAndFixNextJs(
+  project: GeneratedProject,
+  onFile?: (f: GeneratedFile, index: number) => Promise<void> | void
+): Promise<GeneratedProject> {
+  const fileMap = new Map(project.files.map(f => [f.path, f]))
+
+  for (let round = 0; round <= MAX_FIX_ROUNDS; round++) {
+    const check = await checkNextJsBuild(Array.from(fileMap.values()))
+    if (check.success) {
+      return {
+        ...project,
+        files: Array.from(fileMap.values()),
+        summary: round === 0 ? project.summary : `${project.summary}\n\n(Build failed on the first attempt and was auto-fixed after ${round} round(s) using the real build error.)`,
+      }
+    }
+    if (round === MAX_FIX_ROUNDS) {
+      // Out of attempts — return what we have, honestly flagged.
+      return {
+        ...project,
+        files: Array.from(fileMap.values()),
+        summary: `${project.summary}\n\n⚠️ The build still fails after ${MAX_FIX_ROUNDS} auto-fix attempts. Last error:\n${check.output.slice(-800)}`,
+      }
+    }
+
+    // Feed the real build error back and let GLM patch the actual files.
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: 'You are fixing a real build failure in a Next.js project. Use read_file to inspect any file mentioned in the error before editing it. Prefer str_replace_in_file for small fixes over write_file. Call done_fixing once you believe the error is resolved.',
+      },
+      {
+        role: 'user',
+        content: `The build failed with this output:\n\n${check.output}\n\nFix it now.`,
+      },
+    ]
+
+    for (let turn = 0; turn < MAX_FIX_TURNS_PER_ROUND; turn++) {
+      const { content, toolCalls } = await chat(messages, { temperature: 0.2, maxTokens: 4000, tools: FIX_TOOLS })
+      if (toolCalls.length === 0) break // model gave up mid-round with plain text — move to rebuild anyway
+
+      const rawToolCalls: RawToolCall[] = toolCalls.map(tc => ({
+        id: tc.id, type: 'function', function: { name: tc.name, arguments: JSON.stringify(tc.arguments) },
+      }))
+      messages.push({ role: 'assistant', content: content || '', tool_calls: rawToolCalls })
+
+      let done = false
+      for (const tc of toolCalls) {
+        if (tc.name === 'read_file') {
+          const f = fileMap.get(String(tc.arguments.path))
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: f ? f.content : `Error: ${tc.arguments.path} not found` })
+        } else if (tc.name === 'str_replace_in_file') {
+          const path = String(tc.arguments.path)
+          const f = fileMap.get(path)
+          if (!f) {
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: `Error: ${path} not found` })
+            continue
+          }
+          const oldStr = String(tc.arguments.old_str ?? '')
+          const occurrences = f.content.split(oldStr).length - 1
+          if (occurrences !== 1) {
+            messages.push({ role: 'tool', tool_call_id: tc.id, content: `Error: old_str appears ${occurrences} times in ${path}, must be exactly 1` })
+            continue
+          }
+          const updated: GeneratedFile = { ...f, content: f.content.replace(oldStr, String(tc.arguments.new_str ?? '')) }
+          fileMap.set(path, updated)
+          await onFile?.(updated, -1)
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: `Updated ${path}` })
+        } else if (tc.name === 'write_file') {
+          const path = String(tc.arguments.path)
+          const updated: GeneratedFile = { path, content: String(tc.arguments.content ?? ''), language: String(tc.arguments.language || 'text') }
+          fileMap.set(path, updated)
+          await onFile?.(updated, -1)
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: `Saved ${path}` })
+        } else if (tc.name === 'done_fixing') {
+          messages.push({ role: 'tool', tool_call_id: tc.id, content: 'OK' })
+          done = true
+        }
+      }
+      if (done) break
+    }
+    // Loop continues to the next round, which re-runs checkNextJsBuild at the top.
+  }
+
+  // Unreachable, but keeps TypeScript happy.
+  return { ...project, files: Array.from(fileMap.values()) }
 }
 
 // ============================================================
