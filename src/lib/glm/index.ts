@@ -80,8 +80,9 @@ export async function chat(
     maxTokens?: number
     tools?: ToolDefinition[]
     json?: boolean // force JSON output
+    thinking?: boolean // include GLM's reasoning trace (off by default — adds latency/cost, and internal tool loops don't show it to anyone)
   } = {}
-): Promise<{ content: string; toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> }> {
+): Promise<{ content: string; reasoning: string; toolCalls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> }> {
   const res = await fetch(`${baseUrl()}/chat/completions`, {
     method: 'POST',
     headers: {
@@ -95,7 +96,7 @@ export async function chat(
       max_tokens: opts.maxTokens ?? 4096,
       ...(opts.tools ? { tools: opts.tools, tool_choice: 'auto' } : {}),
       ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
-      thinking: { type: 'disabled' },
+      thinking: { type: opts.thinking ? 'enabled' : 'disabled' },
     }),
   })
   if (!res.ok) {
@@ -105,6 +106,7 @@ export async function chat(
   const data = await res.json()
   const choice = data.choices?.[0]
   const content = choice?.message?.content ?? ''
+  const reasoning = choice?.message?.reasoning_content ?? ''
   const rawToolCalls = choice?.message?.tool_calls ?? []
   const toolCalls = rawToolCalls
     .map((tc: any) => ({
@@ -113,7 +115,7 @@ export async function chat(
       arguments: tc.function?.arguments ? JSON.parse(tc.function.arguments) : {},
     }))
     .filter((tc: any) => tc.name)
-  return { content, toolCalls }
+  return { content, reasoning, toolCalls }
 }
 
 /**
